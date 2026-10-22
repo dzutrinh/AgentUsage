@@ -65,3 +65,8 @@ dist/*.*
 build/*.*
 build/.DS_Store
 .DS_Store
+Design/DMGBackground.swift
+Design/Icon.swift
+Design/make_icon.sh
+Design/make_screenshots.sh
+Design/Screenshots.swift
