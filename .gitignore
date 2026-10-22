@@ -60,3 +60,7 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+package.sh
+dist/*.*
+build/*.*
+build/.DS_Store
