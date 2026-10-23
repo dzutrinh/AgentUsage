@@ -1,8 +1,10 @@
 import Foundation
+import AppKit
 
-// Plan limits ("quota"). Claude: live from the endpoint Claude Code's /usage calls,
-// with Claude Code's own cached copy as fallback. Codex: the rate_limits block in its
-// session logs. Copilot: premium requests counted from its usage table.
+// Plan limits ("quota"). Claude: the percentages the Claude desktop app saves locally,
+// optionally live from the endpoint Claude Code's /usage calls (needs the claude CLI's
+// sign-in). Codex: the rate_limits block in its session logs. Copilot: premium requests
+// counted from its usage table. Gemini CLI, Grok and Antigravity keep no limits locally.
 
 struct QuotaWindow: Identifiable, Codable {
     let name: String
@@ -55,9 +57,11 @@ final class ClaudeQuotaSource {
         ("seven_day_opus", "Weekly Opus"), ("seven_day_sonnet", "Weekly Sonnet"),
     ]
 
-    /// Asks the server at most every 5 minutes (every 2 minutes when `force`).
-    /// `live` false uses only Claude Code's cached copy; `autoRenew` false never renews the login.
-    func quota(force: Bool, live useLive: Bool = true, autoRenew: Bool = true) -> AgentQuota? {
+    /// The newest of: the Claude desktop app's saved percentages, the last live reading,
+    /// and Claude Code's own cached copy. With `live`, also asks Anthropic (at most every
+    /// 5 minutes, every 2 when `force`) using the claude CLI's sign-in; `autoRenew` false
+    /// never renews that sign-in.
+    func quota(force: Bool, live useLive: Bool = false, autoRenew: Bool = true) -> AgentQuota? {
         renewer.enabled = autoRenew
         if !useLive { lastError = nil }
         let now = Date()
@@ -78,33 +82,61 @@ final class ClaudeQuotaSource {
         } else if useLive && now < nextAllowed && lastError == nil {
             lastError = waitNote()
         }
-        if !useLive { return cachedOnly() }
-        // Prefer whichever measurement is newer: our live fetch or Claude Code's cache.
-        var best = live
-        if let cached = cached(), (best?.asOf ?? .distantPast) < (cached.asOf ?? .distantPast) { best = cached }
-        if var b = best, let err = lastError { b.note = err; best = b }
-        // A window whose reset time has passed no longer says anything about usage.
-        if var b = best {
-            let now = Date()
-            b.windows = b.windows.map { w in
-                guard let r = w.resetsAt, r <= now else { return w }
+        let readings = [live, desktopHistory(), cached()].compactMap { $0 }.filter { !$0.windows.isEmpty }
+        guard var best = readings.max(by: { ($0.asOf ?? .distantPast) < ($1.asOf ?? .distantPast) }) else {
+            if let err = lastError { return AgentQuota(windows: [], asOf: nil, note: err) }
+            return nil
+        }
+        let taken = best.asOf ?? now
+        best.windows = best.windows.map { w in
+            var resets = w.resetsAt
+            if resets == nil {
+                // The desktop file has no reset times; take them from the other readings.
+                let anchors = readings.flatMap(\.windows).filter { $0.name == w.name }.compactMap(\.resetsAt)
+                resets = Self.nextReset(after: taken, window: w.name, anchors: anchors)
+            }
+            // A window that has reset since the reading no longer says anything about usage.
+            let length = Self.length(of: w.name)
+            if (resets.map { $0 <= now } ?? false) || now.timeIntervalSince(taken) >= length {
                 return QuotaWindow(name: w.name, percent: nil, detail: "reset since last check", resetsAt: nil)
             }
-            best = b
+            return QuotaWindow(name: w.name, percent: w.percent, detail: w.detail, resetsAt: resets)
         }
-        if best == nil, let err = lastError { return AgentQuota(windows: [], asOf: nil, note: err) }
+        if useLive, let err = lastError { best.note = err }
         return best
     }
 
-    /// Live checks switched off: Claude Code's own copy only.
-    private func cachedOnly() -> AgentQuota? {
-        guard var c = cached() else { return nil }
-        let now = Date()
-        c.windows = c.windows.map { w in
-            guard let r = w.resetsAt, r <= now else { return w }
-            return QuotaWindow(name: w.name, percent: nil, detail: "reset since last check", resetsAt: nil)
+    private static func length(of window: String) -> TimeInterval {
+        window == "5-hour" ? 5 * 3600 : 7 * 86400
+    }
+
+    /// Weekly windows reset at the same time every week, so any known reset can be carried
+    /// forward. A 5-hour window starts with the first message after the last one ended,
+    /// so only a reset that falls within the reading's own window can be used.
+    static func nextReset(after t: Date, window: String, anchors: [Date]) -> Date? {
+        let period = length(of: window)
+        if window == "5-hour" {
+            return anchors.filter { $0 > t && $0.timeIntervalSince(t) <= period }.min()
         }
-        return c
+        guard let a = anchors.max() else { return nil }
+        let steps = ((t.timeIntervalSince(a)) / period).rounded(.down) + 1
+        return a.addingTimeInterval(steps * period)
+    }
+
+    /// Percentages the Claude desktop app saves about every 15 minutes while it is in use
+    /// (5-hour "fh", weekly "sd"). No reset times are stored.
+    private func desktopHistory() -> AgentQuota? {
+        let path = FileManager.default.homeDirectoryForCurrentUser.path
+            + "/Library/Application Support/Claude/plan-usage-history.json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let doc = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let samples = doc["samples"] as? [[String: Any]],
+              let last = samples.max(by: { (double($0["t"]) ?? 0) < (double($1["t"]) ?? 0) }),
+              let t = double(last["t"]), let u = last["u"] as? [String: Any] else { return nil }
+        var windows: [QuotaWindow] = []
+        if let fh = double(u["fh"]) { windows.append(QuotaWindow(name: "5-hour", percent: fh, detail: nil, resetsAt: nil)) }
+        if let sd = double(u["sd"]) { windows.append(QuotaWindow(name: "Weekly", percent: sd, detail: nil, resetsAt: nil)) }
+        return AgentQuota(windows: windows, asOf: Date(timeIntervalSince1970: t / 1000), note: nil)
     }
 
     private func save(_ q: AgentQuota) {
@@ -152,7 +184,8 @@ final class ClaudeQuotaSource {
             }
             guard code == 200, let data,
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-                result = .failure("Live quota unavailable (HTTP \(code))."); return
+                result = .failure(code == 401 ? ClaudeTokenRenewer.signInAgain : "Live quota unavailable (HTTP \(code)).")
+                return
             }
             result = .success(AgentQuota(windows: Self.parse(obj), asOf: Date(), note: nil))
         }.resume()
@@ -185,6 +218,49 @@ final class ClaudeQuotaSource {
 
 }
 
+// MARK: - Claude sign-in through Terminal
+
+/// Sign-in is done by the official claude CLI (`claude auth login`, which uses the
+/// browser); the app only opens Terminal for it and never sees the sign-in itself.
+enum ClaudeSignIn {
+    /// One line for Preferences, e.g. "Signed in until Oct 30, 9:41 AM".
+    static func status() -> String {
+        guard let c = ClaudeCredentials.read() else { return "Not signed in" }
+        if c.sessionEnded { return "Sign-in has ended" }
+        if let end = c.refreshExpiresAt {
+            return "Signed in until " + end.formatted(date: .abbreviated, time: .shortened)
+        }
+        return "Signed in"
+    }
+
+    /// Opens Terminal with a one-off script that runs `claude auth login`.
+    static func openTerminal() {
+        let script = """
+            #!/bin/zsh -l
+            export PATH="$HOME/.local/bin:$HOME/.claude/local:/opt/homebrew/bin:/usr/local/bin:$PATH"
+            clear
+            if ! command -v claude >/dev/null 2>&1; then
+                echo "The claude command-line tool is not installed."
+                echo "Install Claude Code from https://claude.com/claude-code, then try again."
+                exit 1
+            fi
+            echo "Signing in to Claude Code. Your browser will open; finish signing in there."
+            echo
+            claude auth login --claudeai
+            echo
+            echo "Done. Agent Usage picks up the new sign-in within a few minutes. You can close this window."
+            """
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Claude sign-in.command")
+        do {
+            try script.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+            NSWorkspace.shared.open(url)
+        } catch {
+            NSSound.beep()
+        }
+    }
+}
+
 // MARK: - Claude Code's Keychain login
 
 /// The `claude` CLI's Keychain item, read and written through /usr/bin/security the
@@ -201,6 +277,12 @@ struct ClaudeCredentials {
     var scopes: [String] { oauth["scopes"] as? [String] ?? [] }
     var expiresAt: Date? { double(oauth["expiresAt"]).map { Date(timeIntervalSince1970: $0 / 1000) } }
     var isExpired: Bool { expiresAt.map { $0 <= Date().addingTimeInterval(30) } ?? false }
+    /// End of the sign-in session: after this the refresh token is refused (HTTP 400)
+    /// and only signing in again with the CLI helps.
+    var refreshExpiresAt: Date? {
+        double(oauth["refreshTokenExpiresAt"]).map { Date(timeIntervalSince1970: $0 / 1000) }
+    }
+    var sessionEnded: Bool { refreshExpiresAt.map { $0 <= Date() } ?? false }
 
     static func read() -> ClaudeCredentials? {
         guard let secret = run(["find-generic-password", "-s", service, "-w"]),
@@ -223,8 +305,12 @@ struct ClaudeCredentials {
         var o = oauth
         o["accessToken"] = access
         if let r = resp["refresh_token"] as? String { o["refreshToken"] = r }
+        let now = Date().timeIntervalSince1970
         if let secs = double(resp["expires_in"]) {
-            o["expiresAt"] = Int64((Date().timeIntervalSince1970 + secs) * 1000)
+            o["expiresAt"] = Int64((now + secs) * 1000)
+        }
+        if let secs = double(resp["refresh_token_expires_in"]) {
+            o["refreshTokenExpiresAt"] = Int64((now + secs) * 1000)
         }
         if let s = resp["scope"] as? String, !s.isEmpty { o["scopes"] = s.split(separator: " ").map(String.init) }
         var doc = document
@@ -268,7 +354,12 @@ final class ClaudeTokenRenewer {
     private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
     private var failedAt = Date.distantPast
+    /// A refresh token the server refused (400/401). Never sent again; cleared when the
+    /// Keychain holds a different one (the user signed in again).
+    private var refusedToken: String?
     var enabled = true
+
+    static let signInAgain = "The claude tool's sign-in has ended; sign in again for live limits. Showing the numbers saved on this Mac."
     /// Renewed tokens that could not be saved yet. The old refresh token may already be
     /// void, so these must reach the Keychain or the CLI ends up signed out.
     private var unsaved: ClaudeCredentials?
@@ -286,11 +377,11 @@ final class ClaudeTokenRenewer {
         if !enabled && !force {
             return .failure("Claude Code's login token has expired; running `claude` in Terminal renews it.")
         }
-        if Date().timeIntervalSince(failedAt) < 30 * 60 {
-            return .failure("Claude Code's login token has expired; renewing failed, retrying later.")
+        guard let refresh = creds.refreshToken, !creds.sessionEnded, refresh != refusedToken else {
+            return .failure(Self.signInAgain) // no request: it would only be refused
         }
-        guard let refresh = creds.refreshToken else {
-            return .failure("Claude Code's login has no refresh token; run `claude` and sign in.")
+        if Date().timeIntervalSince(failedAt) < 30 * 60 {
+            return .failure("Claude Code's login has expired; renewing it failed, retrying later.")
         }
 
         var body: [String: Any] = ["grant_type": "refresh_token", "refresh_token": refresh, "client_id": Self.clientID]
@@ -303,19 +394,25 @@ final class ClaudeTokenRenewer {
 
         let done = DispatchSemaphore(value: 0)
         var outcome: Outcome = .failure("No response while renewing the Claude login.")
+        var refused = false
         URLSession.shared.dataTask(with: req) { data, resp, err in
             defer { done.signal() }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard err == nil, code == 200, let data,
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let fresh = creds.updated(with: obj) else {
-                let why = code == 400 || code == 401 ? "sign in again with `claude`" : "retrying later"
-                outcome = .failure("Renewing the Claude login failed (HTTP \(code)); \(why).")
+                if code == 400 || code == 401 {
+                    refused = true
+                    outcome = .failure(Self.signInAgain)
+                } else {
+                    outcome = .failure("Couldn't renew the Claude login right now; retrying later.")
+                }
                 return
             }
             outcome = .success(fresh)
         }.resume()
         done.wait()
+        if refused { refusedToken = refresh }
         if case .success(let fresh) = outcome, !fresh.save() { unsaved = fresh }
         if case .failure = outcome { failedAt = Date() }
         return outcome

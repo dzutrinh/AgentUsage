@@ -26,7 +26,7 @@ final class Scanner: @unchecked Sendable {
         let d = UserDefaults.standard
         if present.contains(.claude) {
             quotas[.claude] = claudeQuota.quota(force: forceQuota,
-                                                live: d.object(forKey: "claudeLiveQuota") as? Bool ?? true,
+                                                live: d.object(forKey: "claudeLiveQuota") as? Bool ?? false,
                                                 autoRenew: d.object(forKey: "claudeAutoRenew") as? Bool ?? true)
         }
         quotas[.codex] = codex.quota
@@ -43,6 +43,21 @@ final class UsageStore: ObservableObject {
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var isLoading = false
     @Published var loginError: String?
+    /// The claude CLI's sign-in state, for Preferences (see checkClaudeSignIn).
+    @Published private(set) var claudeSignIn = ""
+
+    /// Reads the sign-in state off the main thread (it runs /usr/bin/security).
+    func checkClaudeSignIn() {
+        if frozen { // demo data: never read the real sign-in
+            claudeSignIn = "Signed in until " + Date().addingTimeInterval(6 * 86400)
+                .formatted(date: .abbreviated, time: .shortened)
+            return
+        }
+        Task.detached(priority: .utility) {
+            let s = ClaudeSignIn.status()
+            await MainActor.run { self.claudeSignIn = s }
+        }
+    }
 
     private let scanner = Scanner()
     private var timer: Timer?

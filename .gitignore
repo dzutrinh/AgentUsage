@@ -70,3 +70,6 @@ design/Icon.swift
 design/make_icon.sh
 design/make_screenshots.sh
 design/Screenshots.swift
+design/AppIcon-1024.png
+build/
+dist/

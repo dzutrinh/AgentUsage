@@ -140,7 +140,11 @@ private struct AgentCard: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 if let note = q.note {
-                    Text(note).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+                    Text(note).font(.caption2).foregroundStyle(.orange).lineLimit(3)
+                    if note == ClaudeTokenRenewer.signInAgain {
+                        Button("Sign in with Terminal…") { ClaudeSignIn.openTerminal() }
+                            .controlSize(.small)
+                    }
                 }
             }
         }

@@ -144,22 +144,31 @@ struct DisplayPane: View {
 
 struct AgentsPane: View {
     @EnvironmentObject var store: UsageStore
-    @AppStorage("claudeLiveQuota") private var liveQuota = true
+    @AppStorage("claudeLiveQuota") private var liveQuota = false
     @AppStorage("claudeAutoRenew") private var autoRenew = true
     @AppStorage("copilotAllowance") private var copilotAllowance = 0
 
     var body: some View {
         Form {
             Section {
-                Toggle("Live quota from Anthropic", isOn: $liveQuota)
-                Toggle("Renew the claude CLI login when it expires", isOn: $autoRenew)
-                    .disabled(!liveQuota)
+                Picker("Limits", selection: $liveQuota) {
+                    Text("From this Mac").tag(false)
+                    Text("Live, with Terminal sign-in").tag(true)
+                }
+                if liveQuota {
+                    LabeledContent("Sign-in", value: store.claudeSignIn.isEmpty ? "Checking…" : store.claudeSignIn)
+                    Button("Sign in with Terminal…") { ClaudeSignIn.openTerminal() }
+                    Toggle("Renew the sign-in when it expires", isOn: $autoRenew)
+                }
             } header: {
                 Text("Claude Code")
             } footer: {
                 Text(liveQuota
-                     ? "Uses the login the claude CLI keeps in the Keychain and saves renewed logins back there."
-                     : "Shows the copy Claude Code saves when /usage runs; it can be days old.")
+                     ? "Asks Anthropic every 5 minutes, using the sign-in of the claude command-line tool. "
+                       + "That sign-in lasts a limited time; when it ends, sign in again with Terminal. "
+                       + "The newest numbers from this Mac are still used when they are fresher."
+                     : "Reads the percentages the Claude desktop app saves on this Mac, about every 15 minutes "
+                       + "while it is in use. No sign-in, nothing is sent anywhere.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -171,9 +180,22 @@ struct AgentsPane: View {
                 Text("Your plan's allowance (e.g. 300 for Pro, 1500 for Pro+). 0 shows only the count.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+
+            Section {
+                LabeledContent("Codex", value: "From its session logs")
+                LabeledContent("Gemini CLI", value: "Not kept on this Mac")
+                LabeledContent("Grok", value: "Not kept on this Mac")
+                LabeledContent("Antigravity", value: "Not kept on this Mac")
+            } header: {
+                Text("Other agents' limits")
+            } footer: {
+                Text("These need no sign-in here. Gemini CLI, Grok and Antigravity show their limits only in their own apps.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
-        .onChange(of: liveQuota) { store.refresh(forceQuota: true) }
+        .onAppear { store.checkClaudeSignIn() }
+        .onChange(of: liveQuota) { store.refresh(forceQuota: true); store.checkClaudeSignIn() }
         .onChange(of: copilotAllowance) { store.refresh() }
     }
 }
