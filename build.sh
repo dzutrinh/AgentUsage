@@ -15,15 +15,15 @@ SLICES=()
 for arch in $ARCHS; do
     swiftc -O -swift-version 5 -parse-as-library \
         -target "$arch-apple-macos14.0" \
-        Sources/*.swift -lsqlite3 \
+        src/*.swift -lsqlite3 \
         -o "build/obj/AgentUsage-$arch"
     SLICES+=("build/obj/AgentUsage-$arch")
 done
 lipo -create "${SLICES[@]}" -output "$APP/Contents/MacOS/AgentUsage"
 rm -rf build/obj
 cp Info.plist "$APP/Contents/"
-[ -f Design/AppIcon.icns ] || Design/make_icon.sh
-cp Design/AppIcon.icns "$APP/Contents/Resources/"
+[ -f design/AppIcon.icns ] || design/make_icon.sh
+cp design/AppIcon.icns "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 echo "Built $APP"
 
